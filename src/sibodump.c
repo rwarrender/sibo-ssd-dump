@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include "statwrap.h"
+#include <sys/time.h>
 
 #ifdef _WIN32
     #include <windows.h>
@@ -23,10 +24,20 @@
     // Assume it's something POSIX-compliant
     #include <unistd.h>
     #include <termios.h>
+
+    #include <sys/ioctl.h>
+    #include <IOKit/serial/ioss.h>
     const char *slash = "/";
 #endif
 
 #define BAUDRATE B115200
+
+#define PORT_COMMAND_RESET_SSD      'R'
+#define PORT_COMMAND_FETCH_BLOCK    'f'
+#define PORT_COMMAND_NEXT_DEVICE    'N'
+#define PORT_COMMAND_NEXT_BLOCK     'n'
+#define PORT_COMMAND_GET_SSDINFO    'b'
+#define PORT_COMMAND_GET_ASIC_TYPE  'a' 
 
 #include "argparse/argparse.h"
 static const char *const usage[] = {
@@ -137,6 +148,10 @@ int portcfg(SerialDevice *sd, int speed) {
     return 0;
 }
 
+char* portname(SerialDevice *sd) {
+    return sd->device;
+}
+
 int portsend(SerialDevice *sd, char buffer) {
     DWORD count;
     // printf("Trying to send '%s' (%x)...\n", &buffer, buffer);
@@ -158,6 +173,12 @@ int portclose(SerialDevice *sd) {
     return CloseHandle(sd->portHandle);
 }
 
+unsigned long microsecond_time() {
+    // Perhaps this code will work for windows?
+    // https://git.postgresql.org/gitweb/?p=postgresql.git;a=blob;f=src/port/gettimeofday.c;h=75a91993b74414c0a1c13a2a09ce739cb8aa8a08;hb=HEAD
+    return 0;
+}
+
 #else
 
 int portopen(SerialDevice *sd) {
@@ -176,7 +197,7 @@ int portcfg(SerialDevice *sd, int speed) {
         printf("Error from tcgetattr: %s\n", strerror(errno));
         return -1;
     }
-
+    
     cfsetospeed(&tty, (speed_t)speed);
     cfsetispeed(&tty, (speed_t)speed);
 
@@ -198,14 +219,26 @@ int portcfg(SerialDevice *sd, int speed) {
         printf("Error from tcsetattr: %s\n", strerror(errno));
         return -1;
     }
+
+    #ifdef __APPLE__
+    // Boost to non-standard speed on Mac OS
+    unsigned int speeda = 2000000;
+    ioctl(sd->fd, IOSSIOSPEED, &speeda);
+    #endif
+
     return 0;
+}
+
+const char* portname(SerialDevice *sd) {
+    return sd->device;
 }
 
 int portsend(SerialDevice *sd, char buffer) {
     return write(sd->fd, &buffer, 1);
 }
 
-int portread(SerialDevice *sd, unsigned char *buffer) {
+static inline int portread(SerialDevice *sd, unsigned char *buffer);
+extern inline int portread(SerialDevice *sd, unsigned char *buffer) {
     return read(sd->fd, buffer, 1);
 }
 
@@ -215,6 +248,12 @@ int portflush(SerialDevice *sd) {
 
 int portclose(SerialDevice *sd) {
     return close(sd->fd);
+}
+
+unsigned long microsecond_time() {
+    struct timeval time;
+    gettimeofday(&time, NULL);
+    return (time.tv_sec * 1000) + (time.tv_usec / 1000);
 }
 
 #endif
@@ -318,16 +357,35 @@ void dump(SerialDevice *sd, const char *path) {
     return;
 }
 
-void getblock(SerialDevice *sd, unsigned int blocknum, unsigned char curdev, unsigned char *block) {
-    unsigned int i;
+int portreadfill(SerialDevice *sd, unsigned char *buffer, unsigned int buffer_len) {
+    int remain = buffer_len;
+    int filled = 0;
+    int count = 0;
 
+    while ((count = read(sd->fd, buffer + filled, buffer_len - filled))) {
+        // Update counters
+        remain -= count;
+        filled += count;
+
+        if (remain <= 0) {
+            continue;
+        }
+    }
+
+    // Handle error
+    if (count < 0) {
+        return count;
+    }
+
+    return filled;
+}
+
+void getblock(SerialDevice *sd, unsigned int blocknum, unsigned char curdev, unsigned char *block) {
     printf("Fetch block %d (0 to %d, total %d) on device %d\r", blocknum, ssdinfo.blocks - 1, ssdinfo.blocks, curdev);
     fflush(stdout);
-    portsend(sd, 'f');
-    for (i = 0; i <= 255; i++) {
-        portread(sd, &block[i]);
-        // printf(".");
-    }
+
+    portsend(sd, PORT_COMMAND_FETCH_BLOCK);
+    portreadfill(sd, &block[0], 256);
 }
 
 
@@ -361,9 +419,10 @@ int main (int argc, const char **argv) {
     argc = argparse_parse(&argparse, argc, argv);
 
     portopen(&sd);
-    portcfg(&sd, B57600);
+    portcfg(&sd, B115200);
     usleep(2000000);
     portflush(&sd);
+    printf("DEVICE: %s\n", portname(&sd));
 
     if (allow_asic4 == 0) {
         printf("FORCING ASIC5!\n");
@@ -377,7 +436,7 @@ int main (int argc, const char **argv) {
         printf("Error from write: %d, %d\n", wlen, errno);
     }
 
-    wlen = portsend(&sd, 'b');
+    wlen = portsend(&sd, PORT_COMMAND_GET_SSDINFO);
     if (wlen != 1) {
         printf("Error from write: %d, %d\n", wlen, errno);
     }
@@ -386,10 +445,9 @@ int main (int argc, const char **argv) {
     if (wlen != 1) {
         printf("Error from read: %d, %d\n", wlen, errno);
     }
-
     GetSSDInfo(buffer);
 
-    wlen = portsend(&sd, 'a');
+    wlen = portsend(&sd, PORT_COMMAND_GET_ASIC_TYPE);
     if (wlen != 1) {
         printf("Error from write: %d, %d\n", wlen, errno);
     }
@@ -403,7 +461,7 @@ int main (int argc, const char **argv) {
 
     if (dumppath != NULL) {
         printf("\n");
-        portsend(&sd, 'R');
+        portsend(&sd, PORT_COMMAND_RESET_SSD);
         fp = fopen(dumppath, "wb");
 
         if (firstblockonly != 0) { // fake some SSD info
@@ -446,16 +504,26 @@ int main (int argc, const char **argv) {
 
         // }
 
+        unsigned long starttime = microsecond_time();
+
         for (curdev = 0; curdev < ssdinfo.devs; curdev++) {
             for (i = 0; i < ssdinfo.blocks; i++) {
                 getblock(&sd, curblock, curdev, block);
-                portsend(&sd, 'n');
+                portsend(&sd, PORT_COMMAND_NEXT_BLOCK);
                 curblock++;
-                fwrite(&block, sizeof(block), 1, fp);
+                fwrite(&block, sizeof(unsigned char), sizeof(block), fp);
             }
-            portsend(&sd, 'N');
+            portsend(&sd, PORT_COMMAND_NEXT_DEVICE);
             curblock = 0;
         }
+
+        unsigned long endtime = microsecond_time();
+
+        double duration = ((double)(endtime - starttime)) / 1000.0; 
+        printf("\n\nDump Duration: %f seconds\n", duration);
+
+        double KBps = ((ssdinfo.blocks * 256.0) / duration) / 1000.0;
+        printf("Transfer Speed: %f KBps\n", KBps);
 
         fclose(fp);
         printf("\n");
