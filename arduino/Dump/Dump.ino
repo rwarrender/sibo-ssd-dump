@@ -5,6 +5,8 @@
 // ?  - Are just the first 5 bits reset, so the device (CS) is the same?
 // ?  - Is it untouched?
 
+#include "Physical.h"
+
 #define DATA 3
 #define CLOCK 2
 #define BAUDRATE 115200
@@ -15,8 +17,8 @@
 #define SP_SCTL_WRITE_SINGLE_BYTE 0b10000000
 #define SP_SSEL                   0b01000000
 
-#define ID_ASIC4 6
-#define ID_ASIC5 2
+#define ID_ASIC4 6                // ASCI4 Extended mode (28 address-bits + 8 chip selects)
+#define ID_ASIC5 2                // SSD  (21 address-bits + 4 chip selects max)
 
 struct {
   byte infobyte;
@@ -48,6 +50,7 @@ void dumpblock(int _block) {
   if (!is_asic4 || force_asic5) SetMode(0);
   SetAddress(((unsigned long)_block << 8));
   _Control(SP_SCTL_READ_MULTI_BYTE | 0b0000);
+
   for (int b = 0; b < 256; b++) {
     Serial.write(_DataI());
   }
@@ -55,10 +58,11 @@ void dumpblock(int _block) {
 
 void setup() {
   Serial.begin(BAUDRATE);
-  pinMode(CLOCK, OUTPUT);
-  pinMode(DATA, INPUT);
-  digitalWrite(CLOCK, LOW);
   
+  pinMode(CLOCK, OUTPUT);
+  digitalWrite(CLOCK, LOW);
+
+  _Null();
   Reset();
 }
 
@@ -79,11 +83,13 @@ void loop() {
      case 'a':
      case 'A':
       Serial.write(is_asic4 ? 4 : 5);
+      Serial.flush();
       break;
 
      case 'b':
      case 'B':
       Serial.write(ssdinfo.infobyte);
+      Serial.flush();
       break;
  
      case 'd':
@@ -133,19 +139,19 @@ void printinfo() {
       Serial.println("RAM");
       break;
     case 1:
-      Serial.println("Type 1 Flash");
+      Serial.println("Type 1 Flash (INTEL)");
       break;
     case 2:
       Serial.println("Type 2 Flash");
       break;
     case 3:
-      Serial.println("TBS");
+      Serial.println("Type 3 Flash");
       break;
     case 4:
-      Serial.println("TBS");
+      Serial.println("Type 4 Flash");
       break;
     case 5:
-      Serial.println("???");
+      Serial.println("Type 5 Flash");
       break;
     case 6:
       Serial.println("ROM");
@@ -266,7 +272,7 @@ void _SetAddress5(unsigned long address) {
   byte a2 = ((address >> 16) & 0b00011111) | ((curdev << 6) & 0b11000000);
 
   // ports D + C????
-  _Control(SP_SCTL_WRITE_MULTI_BYTE | 0b0011); 
+  _Control(SP_SCTL_WRITE_MULTI_BYTE | 0b0011); // Address register (16-bit)
   _DataO(a1);
   _DataO(a2);
   
@@ -322,99 +328,16 @@ void SetAddress(unsigned long address) {
 //   }
 // }
 
-
 void SetMode(byte mode) {
   // changed from 0b10100010
   _Control(SP_SCTL_WRITE_SINGLE_BYTE | 0b0010);
   _DataO(mode & 0x0F);
 }
 
-void _Control(byte data) {
-  _SendCtrlHeader();
-  
-  pinMode(DATA, OUTPUT);
-  for (byte _dx = 0; _dx < 8; _dx++) {
-    digitalWrite(DATA, ((data & (0b00000001 << _dx)) == 0) ? LOW : HIGH);
-    _Cycle(1);
-  }
-  
-  digitalWrite(DATA, LOW);
-  _Cycle(1);
-  
-  pinMode(DATA, INPUT);
-}
-
-void _Cycle(byte cycles) {
-  for (byte _cx = 0; _cx < cycles; _cx++) {
-    digitalWrite(CLOCK, HIGH);
-    digitalWrite(CLOCK, LOW);
-  }
-}
-
 void _SendBitAndLatch(uint8_t state) {
-  digitalWrite(DATA, state);
+  _DataWrite(state);
   _Cycle(1);
 }
-
-
-// _SendIdleBit()
-// Tristates the pin by setting it to INPUT to comply with Psion standards,
-// then sends a clock pulse
-void _SendIdleBit() {
-  digitalWrite(DATA, LOW); 
-  pinMode(DATA, INPUT);
-  _Cycle(1);
-}
-
-// _SendDataHeader()
-// Send start bit, high Select bit, then the idle bit
-void _SendDataHeader() {
-  pinMode(DATA, OUTPUT);
-  digitalWrite(DATA, HIGH);
-  _Cycle(2);
-  _SendIdleBit();
-}
-
-// _SendCtrlHeader()
-// Send start bit, low Select bit, then the idle bit
-void _SendCtrlHeader() {
-  pinMode(DATA, OUTPUT);
-  digitalWrite(DATA, HIGH);
-  _Cycle(1);
-  digitalWrite(DATA, LOW);
-  _Cycle(1);
-  _SendIdleBit();
-}
-
-byte _DataI() {
-  byte input = 0;
-
-  _SendDataHeader();
-  pinMode(DATA, INPUT);
-  
-  for (byte _dx = 0; _dx < 8; _dx++) {
-    digitalWrite(CLOCK, HIGH);
-    input = input | (digitalRead(DATA) << _dx);
-    digitalWrite(CLOCK, LOW);
-  }
-
-  _SendIdleBit();
-  return input;
-}
-
-void _DataO(byte data) { 
-  _SendDataHeader();
-  pinMode(DATA, OUTPUT);
-  
-  for (byte _dx = 0; _dx < 8; _dx++) {
-    digitalWrite(DATA, ((data & (0b00000001 << _dx)) == 0) ? LOW : HIGH);
-    digitalWrite(CLOCK, HIGH);
-    digitalWrite(CLOCK, LOW);
-  }
-  
-  _SendIdleBit();
-}
-
 
 void _GetSSDInfo() {
   ssdinfo.infobyte = _DataI();
@@ -423,10 +346,4 @@ void _GetSSDInfo() {
   ssdinfo.devs   = ((ssdinfo.infobyte & 0b00011000) >> 3) + 1;
   ssdinfo.size   = (ssdinfo.infobyte & 0b00000111);
   ssdinfo.blocks = (ssdinfo.size == 0) ? 0 : ((0b10000 << ssdinfo.size) * 4);
-}
-
-
-void _Null() {
-  pinMode(DATA, INPUT);
-  _Cycle(12);
 }
